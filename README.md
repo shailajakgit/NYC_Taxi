@@ -2,6 +2,8 @@
 # Purpose
 The purpose of this project is to predict the total taxi ride duration based on NYC Taxi and Limousine Commission dataset from [this](https://www.kaggle.com/c/nyc-taxi-trip-duration) kaggle competition.
 
+Click [HTML markdown version](http://htmlpreview.github.io/?https://github.com/shailajakgit/NYC_Taxi/blob/master/Taxi_Ride.html) to look at the analysis.
+
 # Data Description
 
 * id - a unique identifier for each trip
