@@ -1,0 +1,395 @@
+---
+title: "NYC_Taxi_Ride"
+author: "Shailaja_Kotagiri"
+date: "October 2, 2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r lib, libraries}
+suppressWarnings(library(tidyr)) 
+suppressWarnings(library(dplyr))
+suppressWarnings(library(MASS))
+suppressWarnings(library(randomForest))
+suppressWarnings(library(xgboost))
+suppressWarnings(library(caret))
+suppressWarnings(library(NMOF))
+suppressWarnings(library(zipcode))
+```
+
+The objective of this project is to build a model to predict the duration of taxi trips in New York city based on individual trip attributes. Duration of the trip is in seconds.
+
+```{r, read data}
+trainTrip <- read.csv("train.csv",header = T)
+dim(trainTrip)
+glimpse(trainTrip)
+
+```
+## 1. Feature Engineering:
+
+Find the observations with the same longitute and lattitude for both pick-up and drop-off locations. While these may be the obervations where the passengers may have gone for a ride around the block, these do not contribute to taxi ride duration prediction accuracy. Therefore, discarding these obseervations.
+
+
+```{r, EDA}
+## Observations with pickup lat-long similar to dropoff lat-long.
+dim(trainTrip[trainTrip$pickup_latitude==trainTrip$dropoff_latitude & 
+                trainTrip$pickup_longitude==trainTrip$dropoff_longitude,])
+
+## Remove such anomalous observations.
+trainTrip <- trainTrip[!(trainTrip$pickup_latitude==trainTrip$dropoff_latitude & 
+                           trainTrip$pickup_longitude==trainTrip$dropoff_longitude),]
+
+```
+
+Convert date variables datetime data type. For ease of comparision, the following code converts all dates to EST. It also extracts pick hour, day and month.
+
+```{r, date conversion}
+# Convert pickup and dropoff datetimes into POSIXct
+trainTrip$pickup_datetime <- as.POSIXct(trainTrip$pickup_datetime,format = "%Y-%m-%d %H:%M:%S",usetz = F,tz="EST")
+trainTrip$dropoff_datetime <- as.POSIXct(trainTrip$dropoff_datetime,format = "%Y-%m-%d %H:%M:%S",usetz = F,tz="EST")
+
+# Get pickup hour
+trainTrip$PickupHour <- as.factor(format(trainTrip$pickup_datetime, "%H"))
+
+# Get pickup weekday
+trainTrip$PickupWeekday <- weekdays(trainTrip$pickup_datetime )
+
+# Get pickup month
+trainTrip$PickupMonth <- as.factor(format(trainTrip$pickup_datetime, "%m"))
+
+```
+
+Trip duration should be positively correlated with distance between pickup and drop off points. Apart from using longitude and latitude parameters as they are, one can also use distance between the points.  But due to the roughly spherical shape of the earth, distance between two points specified by longitude and latitude can be calculated using Haversine formula (in kilo meaters). The follwing calculates Haversine distance between pickup and dropoff points. The formula requires points to be converted to radian from degrees.
+
+```{r, calculate distance}
+
+# Function to convert degrees to radians
+deg2rad <- function(deg){
+  return(deg*pi/180)
+}
+
+# Get distance based on Haversine
+getDistance <- function(intDistance){
+  # Radius of the earth at the equator
+  R <- 6371
+  return(R * 2* atan2(intDistance^0.5,(1-intDistance)^0.5))
+}
+
+intermediateVal <- sin((deg2rad(trainTrip$dropoff_latitude)-deg2rad(trainTrip$pickup_latitude))/2)^2 +
+  (cos(deg2rad(trainTrip$pickup_latitude)) * cos(deg2rad(trainTrip$dropoff_latitude)) *
+     sin((deg2rad(trainTrip$dropoff_longitude)-deg2rad(trainTrip$pickup_longitude))/2)^2)
+
+trainTrip$distance <- getDistance(intermediateVal)
+ 
+```
+
+However, Haversine formula gives distance analogous to euclidean distance rather than manhattan distance. But manhattan distance is more appropriate for this use case. The following code attempts to calculate  manhattan distance using the same Haversine formula twice, once in direction of longitude and the second time in the direction of longitude. Then sums the two parts to arrive at manhattan distance. 
+
+```{r, manhattan distance}
+# Calculate distance using latitude alone
+lattitudinalDistance <- sin(deg2rad(trainTrip$dropoff_latitude - trainTrip$pickup_latitude)/2)^2
+
+# Calculate distance using longitude alone
+longitudinalDistance <- cos(deg2rad(trainTrip$pickup_latitude)) * cos(deg2rad(trainTrip$dropoff_latitude)) *
+  sin(deg2rad(trainTrip$dropoff_longitude - trainTrip$pickup_longitude)/2)^2
+
+# Sum the above to quantities to get manhattan distance
+trainTrip$ManhattanDistance <- getDistance(lattitudinalDistance) + getDistance(longitudinalDistance)
+
+```
+
+## 2. Data Cleaning 
+
+Examine the distribution of the response variable (trip duration): The histogram shows only a single bin with values and a long tail. Theis suggests the existance of outliers. Boxplot gives a more detailed view of the quartiles and outliers in the response variable,where as summary gives the numeric values of the quartiles. Boxplot clearly shows the apparent outliers which are beyond 1,000,000 seconds 
+(more than 11.5 days of taxi ride!). These must be removed to be able to visualize the rest of the trip durations.
+
+```{r, trip duration distribution}
+# Histogram of trip duration
+hist(trainTrip$trip_duration)
+
+# Box plot
+boxplot(trainTrip$trip_duration)
+
+# Summary shows the 
+summary(trainTrip$trip_duration)
+# dim(trainTrip[(trainTrip$trip_duration > 1000000),])
+
+# Clearly, these are outliers. Remove the obvious outliers to get a closer look.
+trainTrip <- trainTrip[!(trainTrip$trip_duration > 1000000),]
+
+
+```
+
+The rest of the trip durations still have a large number of outliers. But identification of outliers needs another variable to be able to systamatically identify them. Distance is a very good measure to identify utliers in trip durations. One of the ways of identifying the outliers is using copula. 
+
+```{r, data cleaning2}
+# Box plot
+boxplot(trainTrip$trip_duration)
+
+
+```
+
+Copula describes dependence between random variables. Empirical copula can be identified by the multivariate distribution of the rank transformed random varible marginal distributions. The emipical copula is then compared to a theoritical copula to identify the outliers. The follosing code plots the rank distribution of manhattan distance and trip duration. Ranks are normalized by the saample length to limit the range of ranks to 0-1.
+
+```{r, copula}
+# Find sample size
+nsample <- nrow(trainTrip)
+# plot the empirical copula 
+plot(base::rank(trainTrip$ManhattanDistance,ties.method="first")/nsample, 
+     base::rank(trainTrip$trip_duration,ties.method="first")/nsample,
+     xlab = "Distance rank",
+     ylab = "Trip duration rank",
+     main = "Empirical copula of manhattan distance and trip duration")
+
+```
+
+The resultant empirical does not represent any theoritial copulae I know (Gaussian, Gumbel, Frank or Clayton). Therefore, copula cannot be used to identify outliers. However, the plot points at the following interesting observations:
+1. The thick back line of observations on the left side of the plot shows that there are many observations among which the trip duration for small distances vary  greatly.
+
+2. The bottom-right part of the plot indicates the presence of observations where it took relaatively short time to travel long distances.
+
+The following code attempts to plot empirical copula using euclidean distance. This copula cannot be used, either.
+
+```{r, copula3}
+# Find sample size
+nsample <- nrow(trainTrip)
+# plot the empirical copula  with euclidean distance
+plot(base::rank(trainTrip$distance,ties.method="first")/nsample, 
+     base::rank(trainTrip$trip_duration,ties.method="first")/nsample,
+     xlab = "Distance rank",
+     ylab = "Trip duration rank",
+     main = "Empirical copula of euclidean distance and trip duration")
+
+
+```
+
+
+Since distance and time are suppossed to be positively correlated, but the following scatter plot between distance and trip duration doesn't show such pattern due to the outliers in distance.
+
+Linear regression depends on the correlation structure of the response and independent variable. It may be helpful in identifying the outliers. The following code also fits a linear regression model to distance and trip duration variables.
+
+```{r, lm for o}
+
+plot(trainTrip$distance, 
+     trainTrip$trip_duration,
+     xlab = "Distance",
+     ylab = "Trip durationdepend",
+     main = "Trip duration Vs Distance")
+
+
+# Linear model using euclidean distance 
+lmEuclideanDistance <- lm(trip_duration~distance,trainTrip)
+summary(lmEuclideanDistance)
+
+# Linear model using euclidean distance 
+lmMahnattanDistance <- lm(trip_duration~ManhattanDistance,trainTrip)
+summary(lmMahnattanDistance)
+
+par(mfrow =c(1,2))
+qqnorm(lmEuclideanDistance$residuals)
+qqline(lmEuclideanDistance$residuals)
+
+qqnorm(lmMahnattanDistance$residuals)
+qqline(lmMahnattanDistance$residuals)
+
+```
+
+Both regression equations show distances to be significant in estimating trip durations, but they result in very low r-squared (2%) due to the presence of outliers. QQplots show very heavy right tails.
+
+In order to identify and remove outliers, now we need to chose one distance over the other. The following code identifies outliers according to both models and creates two datasets by removing outlying observations according to each model. Outlier are those observation with residuals that  fall beyond 3 standard deviations.
+```{r, manhattan}
+# calculate standard deviation of residuals of model with manhattan distance
+sdResMD <- sd(lmMahnattanDistance$residuals)
+
+# Find the outlier, which are beyond 3 standard deviations.
+manhattanDistanceOutlierIndex <- which((lmMahnattanDistance$residuals)/sdResMD < -3 | 
+                                         (lmMahnattanDistance$residuals)/sdResMD > 3, arr.ind = T)
+# Remove outliers
+trainTripManhattanDistance <- trainTrip[-manhattanDistanceOutlierIndex,]
+
+# Number of outliers
+length(manhattanDistanceOutlierIndex)
+
+# calculate standard deviation of residuals of model with euclidean distance
+sdResED <- sd(lmEuclideanDistance$residuals)
+
+# Find the outlier, which are beyond 3 standard deviations.
+euclideanDistanceOutlierIndex <- which((lmEuclideanDistance$residuals)/sdResED < -3 | 
+                                         (lmEuclideanDistance$residuals)/sdResED > 3, arr.ind = T)
+
+# remove outliers
+trainTripEuclideanDistance <- trainTrip[-euclideanDistanceOutlierIndex,]
+
+# Number of outliers
+length(euclideanDistanceOutlierIndex)
+
+#Removing the main trainTrip data frame from memory, since it will no longer be used.
+rm(trainTrip)
+```
+
+Fit the linear regression to check if the fit has improved.
+
+```{r, lm2}
+# Linear model without outliers
+lmwoOutliersManhattan <- lm(trip_duration~ManhattanDistance,trainTripManhattanDistance)
+
+# Summary of linear model without outliers
+summary(lmwoOutliersManhattan)
+
+# Linear model without outliers
+lmwoOutliersEuclidean <- lm(trip_duration~distance,trainTripEuclideanDistance)
+
+# Summary of linear model without outliers
+summary(lmwoOutliersEuclidean)
+
+par(mfrow =c(1,2))
+# Residual analysis
+qqnorm(lmwoOutliersManhattan$residuals)
+qqline(lmwoOutliersManhattan$residuals)
+
+# Residual analysis
+qqnorm(lmwoOutliersEuclidean$residuals)
+qqline(lmwoOutliersEuclidean$residuals)
+
+
+```
+
+## 3. Model Building
+
+Removal of outliers has dramatically improved the fit from 2% r-squared to 59% r-squared in case of both the models. Residual QQplot still shows outliers in the form of heavy tails. However, euclidean distance model results in a slightly better r-squared (59% compared to 57% using manhattan distance). Therefore, the further analysis will consider euclidean distance.
+
+```{r, remove unnecessay objects}
+# Remove the manhattanDistance dataset since it will no longer be used.
+rm(trainTripManhattanDistance)
+
+# A function to evaluate the fit of a theritical distribution to the trip duration.
+evaluateDistributionFit <- function(randomVar, distribution, theoriticalDistFunction){
+  
+  #set seed to ensure repeatability
+  set.seed(0)
+  
+  # Call fitdistr method to estimate distribution parameters
+  fitParams <- fitdistr(randomVar, distribution)
+  
+  # Length of random variable vector
+  size = length(randomVar)
+  
+  # Extract individual parameters with lapply
+  listParams <- lapply(c(size,fitParams$estimate), function(x){x})
+  
+  # Perform ks.test on the random variable and theoritical distribution of your choice with
+  # the given distribution parameters.
+  fit <- ks.test(randomVar, do.call(match.fun(theoriticalDistFunction),listParams))
+
+  # Return the p-value
+  return(fit$p.value)
+}
+
+exponentialPVal <- evaluateDistributionFit(trainTripEuclideanDistance$trip_duration,"exponential","rexp")
+gammaPVal <- evaluateDistributionFit(trainTripEuclideanDistance$trip_duration,"gamma","rgamma")
+poisPVal <- evaluateDistributionFit(trainTripEuclideanDistance$trip_duration,"Poisson","rpois")
+nbPVal <- evaluateDistributionFit(trainTripEuclideanDistance$trip_duration,"negative binomial","rnbinom")
+
+# Distribution p-values
+(c(exponentialPVal=exponentialPVal,gammaPVal=gammaPVal,poisPVal=poisPVal,nbPVal=nbPVal))
+
+```
+
+
+None of the distribution p-values is > 0.05. Therefore, trip duration doesn't fit any of the distributions.
+
+
+```{r, custom fit evaluation function}
+set.seed(1000)
+completeIndex <- sample(c(1:nrow(trainTripEuclideanDistance)), 10000)
+sampleTrain <- trainTripEuclideanDistance[completeIndex,
+                                          c("distance","vendor_id","passenger_count",
+                                            "store_and_fwd_flag","PickupHour","PickupWeekday",
+                                            "id",
+                                         "trip_duration","pickup_latitude","pickup_longitude",
+                                         "dropoff_latitude","dropoff_longitude")]
+
+customRMSLE <- function(data, lev = NULL, model = "rf"){
+  data$pred <- ifelse((1+data$pred) <=0,10^-16,data$pred)
+  RMSLE_val <- (sum((log(1+data$pred)-log(data$obs+1))^2)/length(data$pred))^0.5
+  return(c(RMSLE = RMSLE_val))
+}
+
+```
+
+
+```{r, llinear model cv}
+set.seed(1000)
+trCtrl <- trainControl(method = "cv", number = 10,
+                       summaryFunction = customRMSLE)
+##  Linear model
+lmTrain <- train(trip_duration~distance+vendor_id+passenger_count+store_and_fwd_flag+PickupHour+PickupWeekday,
+                 data = sampleTrain,
+                 method = "lm",
+                 maximize = FALSE,
+                 trControl = trCtrl)
+
+lmTrain$results
+
+```
+
+```{r, random forest cv}
+
+
+set.seed(1000)
+trCtrl <- trainControl(method = "cv", number = 10,
+                       savePredictions = T,
+                       summaryFunction = customRMSLE)
+tuneGrd <- data.frame( mtry = c(3,4))
+##  randomforest
+rfTrain <- train(trip_duration~distance+vendor_id+passenger_count+store_and_fwd_flag+PickupHour+PickupWeekday,
+                 data = sampleTrain,
+                 method = "rf",
+                 maximize = FALSE,
+                 trControl = trCtrl,
+                 tuneGrid = tuneGrd,
+                 ntree = 400)
+
+rfTrain$results
+```
+
+
+```{r, xgbiist cv}
+paramGrid <- expand.grid(nrounds = c(150,200,250), max_depth  = c(4,5), eta = c(0.2,0.3,0.4), gamma = 0,colsample_bytree=1,
+                         min_child_weight=1,subsample=1)
+set.seed(1000)
+trCtrl <- trainControl(method = "cv", number = 5,
+                       savePredictions = T,
+                       summaryFunction = customRMSLE)
+
+##  Boosted trees
+xgbTrain <- train(trip_duration~distance+vendor_id+passenger_count+store_and_fwd_flag+PickupHour+PickupWeekday,
+                 data = sampleTrain,
+                 method = "xgbTree",
+                 maximize = FALSE,
+                 trControl = trCtrl,
+                 tuneGrid = paramGrid)
+
+xgbTrain$results
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
